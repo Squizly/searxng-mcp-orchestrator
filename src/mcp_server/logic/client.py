@@ -41,17 +41,17 @@ class SearxClient:
                     duration = time.perf_counter() - start_time
                     results_count = len(data.get('results', []))
                     
-                    logger.info(f"✅ Local search successful in {duration:.2f}s | Results found: {results_count}")
+                    logger.info(f"Local search successful in {duration:.2f}s | Results found: {results_count}")
                     return data
                     
             except httpx.ConnectError:
-                logger.error("❌ Connection Error! Ensure the Docker container is running at http://127.0.0.1:8080.")
+                logger.error("Connection Error! Ensure the Docker container is running at http://127.0.0.1:8080.")
                 if attempt == max_retries - 1:
                     raise Exception("Unable to connect to the local SearxNG container.")
                 await asyncio.sleep(1)
                 
             except Exception as e:
-                logger.warning(f"⚠️ Search error (Attempt {attempt+1}): {repr(e)}")
+                logger.warning(f"Search error (Attempt {attempt+1}): {repr(e)}")
                 if attempt == max_retries - 1:
                     raise
                 await asyncio.sleep(1)
