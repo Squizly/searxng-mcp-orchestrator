@@ -1,0 +1,13 @@
+use_default_settings: true
+
+server:
+  secret_key: "A-b-c-d-___a-very-secret-key___-e-f-g"
+  limiter: false
+  image_proxy: true
+
+search:
+  safe_search: 0
+  autocomplete: "google"
+  formats:
+    - html
+    - json
