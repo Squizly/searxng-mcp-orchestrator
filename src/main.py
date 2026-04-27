@@ -17,13 +17,27 @@ def main() -> None:
     """Точка входа приложения."""
     repo_root = _prepare_sys_path()
 
+    from src.utils.runtime import configure_runtime_environment
     from src.utils.logger import setup_logger
-    from src.agent import SearchAgent
-    from src.interfaces.terminal import TerminalApp, MCPBackend
-    from src.mcp_server import create_mcp_server
 
+    configure_runtime_environment()
     setup_logger()
+    if "--searxng-mcp-server" in sys.argv:
+        from src.mcp_server import create_searxng_search_server
+
+        try:
+            mcp_server = create_searxng_search_server()
+            mcp_server.run()
+        except Exception as exc:
+            print(f"Не удалось запустить внутренний MCP search-server: {exc}", file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+        return
+
     if "--mcp-server" in sys.argv:
+        from src.agent import SearchAgent
+        from src.mcp_server import create_mcp_server
+
         try:
             agent = SearchAgent()
         except Exception as exc:
@@ -37,14 +51,18 @@ def main() -> None:
             print(f"Не удалось запустить MCP-сервер: {exc}", file=sys.stderr)
             traceback.print_exc()
             sys.exit(1)
+        finally:
+            agent.close()
         return
 
     try:
+        from src.interfaces.terminal import TerminalApp, MCPBackend
+
         backend = MCPBackend(repo_root)
     except Exception as exc:
         print(f"Не удалось запустить MCP-клиент: {exc}", file=sys.stderr)
         sys.exit(1)
-    TerminalApp(backend, title="SearxNG Search Agent (режим MCP)").run()
+    TerminalApp(backend, title="SearxNG MCP Orchestrator").run()
     return
 
 

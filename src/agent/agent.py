@@ -1,147 +1,94 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from config.settings import settings
-from src.agent.prompts import build_decision_prompt, build_summary_prompt
+from src.agent.prompts import build_direct_answer_prompt, build_search_route_prompt, build_summary_prompt
 from src.llm import create_llm
-from src.searxng import ResponseProcessor, SearxngClient
+from src.searxng import ResponseProcessor, RetrievalPipeline, SearxngClient
 
 logger = logging.getLogger("searxng_agent")
+ProgressCallback = Callable[[str, float, float], Awaitable[None]]
 
 
 class SearchAgent:
-    """Поисковый агент: формирует запросы, ищет и суммаризирует результаты."""
 
-    def __init__(self, instance_url: Optional[str] = None):
-        self.client = SearxngClient(instance_url)
+    def __init__(self):
+        self.client = SearxngClient()
         self.processor = ResponseProcessor()
+        self.retrieval_pipeline = RetrievalPipeline(self.client, self.processor)
         self.llm = create_llm()
         logger.info("Агент готов. Провайдер LLM: %s", settings.llm_provider)
 
-    def search(
+    async def search(
         self,
         query: str,
         limit: int = 5,
         language: Optional[str] = None,
         categories: Optional[str] = None,
-    ) -> List[Dict[str, object]]:
+    ) -> List[Dict[str, Any]]:
+        """Базовый retrieval-пайплайн (SearxNG -> 2-stage rerank -> top-k)."""
         start_ts = time.perf_counter()
-        logger.info("Прямой поиск | Старт | Запрос=%r", query)
-
         try:
-            raw = self.client.search(query, language=language, categories=categories, limit=limit)
+            processed = await self.retrieval_pipeline.run(
+                query=query,
+                language=language,
+                categories=categories,
+                final_limit=limit,
+            )
+            elapsed = (time.perf_counter() - start_ts) * 1000
+            logger.info("Поиск завершен: %d результатов за %.0fмс", len(processed), elapsed)
+            return processed
         except Exception as exc:
-            logger.error("Прямой поиск | Ошибка SearxNG | %s", exc)
+            logger.error("Ошибка SearxNG: %s", exc)
             return []
 
-        processed = self.processor.process_results(raw)
-        elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
-        logger.info("Прямой поиск | Готово | Результатов=%d | Время=%.0fмс", len(processed), elapsed_ms)
-        return processed[:limit]
-
-    def smart_search(
+    async def smart_search(
         self,
         query: str,
         limit: int = 5,
         language: Optional[str] = None,
         categories: Optional[str] = None,
+        progress: Optional[ProgressCallback] = None,
     ) -> str:
+        """Второй пайплайн:
+        запрос -> решение агента (искать/не искать) -> (поиск или прямой ответ) -> ответ пользователю.
+        """
         total_start = time.perf_counter()
-        logger.info("Умный поиск | Старт | Запрос=%r", query)
 
-        logger.info("Умный поиск | Этап 1/3 | Решение LLM о доп. запросах")
-        search_queries = self._decide_queries(query)
+        await self._notify_progress(progress, "Агент решает, нужен ли веб-поиск", 5, 100)
+        use_search = await self._decide_use_search(query)
+        logger.info("Второй пайплайн | Решение агента | use_search=%s", use_search)
 
-        stage2_start = time.perf_counter()
-        logger.info("Умный поиск | Этап 2/3 | Поиск в SearxNG (параллельно)")
-        all_results: List[Dict[str, object]] = []
-        errors: List[str] = []
-        max_workers = min(len(search_queries), settings.searxng_parallelism)
-        logger.info(
-            "Умный поиск | Этап 2/3 | Запросов=%d | Параллельность=%d",
-            len(search_queries),
-            max_workers,
-        )
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {}
-            for q in search_queries:
-                logger.info("Умный поиск | Этап 2/3 | Отправка запроса в SearxNG | %r", q)
-                future = executor.submit(
-                    self.client.search,
-                    q,
-                    language=language,
-                    categories=categories,
-                    limit=limit,
-                )
-                future_map[future] = q
-
-            for future in as_completed(future_map):
-                q = future_map[future]
-                try:
-                    raw = future.result()
-                    logger.info(
-                        "Умный поиск | Этап 2/3 | Получен ответ SearxNG | Запрос=%r | Тип=%s",
-                        q,
-                        type(raw).__name__,
-                    )
-                    logger.debug("SearxNG JSON | Запрос=%r | Данные=%s", q, raw)
-                except Exception as exc:
-                    err = f"{type(exc).__name__}: {exc}"
-                    errors.append(err)
-                    logger.error("Умный поиск | Этап 2/3 | Ошибка SearxNG | Запрос=%r | %s", q, err)
-                    continue
-
-                processed = self.processor.process_results(raw)
-                logger.info(
-                    "Умный поиск | Этап 2/3 | Обработка ответа | Запрос=%r | Результатов=%d",
-                    q,
-                    len(processed),
-                )
-                all_results.extend(processed)
-                logger.debug("SearxNG | Запрос=%r | Найдено=%d", q, len(processed))
-
-        deduped = self._dedupe_results(all_results)
-        stage2_ms = (time.perf_counter() - stage2_start) * 1000.0
-        logger.info(
-            "Умный поиск | Этап 2/3 | Итого результатов=%d | После дедупликации=%d | Время=%.0fмс",
-            len(all_results),
-            len(deduped),
-            stage2_ms,
-        )
-
-        if not deduped and errors:
-            return (
-                "Ошибка поиска: не удалось связаться с SearxNG. "
-                "Проверьте, запущен ли экземпляр SearxNG и корректен ли URL."
+        if not use_search:
+            await self._notify_progress(progress, "Формулирую ответ без веб-поиска", 35, 100)
+            final_answer = await self._answer_without_search(query)
+        else:
+            pipeline_results = await self.retrieval_pipeline.run(
+                query=query,
+                language=language,
+                categories=categories,
+                # 2-й пайплайн: top-10 после первого реранка.
+                stage1_top_k=settings.smart_pipeline_stage1_top_k,
+                # 2-й пайплайн: top-2 после второго реранка.
+                final_limit=min(max(limit, 1), settings.smart_pipeline_final_top_k),
+                progress=progress,
             )
+            top_results = self._dedupe_results(pipeline_results)
+            if not top_results:
+                await self._notify_progress(progress, "Поиск завершён, релевантных результатов не найдено", 100, 100)
+                return "К сожалению, по вашему запросу ничего не найдено."
+            await self._notify_progress(progress, "Суммаризирую найденные источники", 88, 100)
+            final_answer = await self._summarize_results(query, top_results[: settings.smart_pipeline_final_top_k])
 
-        logger.info("Умный поиск | Этап 2/3 | Реранкинг результатов")
-        reranked = self._rerank_results(query, deduped)
-        top_results = reranked[: max(limit, 1)]
-        logger.info("Умный поиск | Этап 2/3 | Реранкинг готов | Топ=%d из %d", len(top_results), len(reranked))
-        for idx, res in enumerate(top_results, 1):
-            logger.info(
-                "Умный поиск | Этап 2/3 | Топ %d | score=%.3f | title=%r | url=%r",
-                idx,
-                float(res.get("_rank_score", 0.0) or 0.0),
-                (res.get("title") or "")[:120],
-                res.get("url"),
-            )
-
-        stage3_start = time.perf_counter()
-        logger.info("Умный поиск | Этап 3/3 | Суммаризация")
-        final_answer = self._summarize_results(query, top_results)
-        stage3_ms = (time.perf_counter() - stage3_start) * 1000.0
-        total_ms = (time.perf_counter() - total_start) * 1000.0
-        logger.info("Умный поиск | Этап 3/3 | Готово | Время=%.0fмс", stage3_ms)
-        logger.info("Умный поиск | Завершено | Время=%.0fмс", total_ms)
+        total_ms = (time.perf_counter() - total_start) * 1000
+        logger.info("Smart Search завершен за %.0fмс", total_ms)
+        await self._notify_progress(progress, "Ответ готов", 100, 100)
         return final_answer
 
     def get_status(self) -> Dict[str, str]:
@@ -154,8 +101,13 @@ class SearchAgent:
         return {
             "provider": provider,
             "model": model,
-            "searxng": getattr(self.client, "instance_url", "-"),
+            "searxng": getattr(self.client, "backend_label", getattr(self.client, "instance_url", "-")),
         }
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
     def set_provider(self, provider: str, model: Optional[str] = None) -> str:
         provider = self._normalize_provider(provider)
@@ -232,44 +184,30 @@ class SearchAgent:
             logger.error("Ошибка смены модели: %s", exc)
             return f"Не удалось сменить модель: {exc}"
 
-    def _decide_queries(self, user_input: str) -> List[str]:
-        """Решает, нужны ли доп. запросы. Если нужны — генерирует до 3 вариантов."""
+    async def _decide_use_search(self, user_input: str) -> bool:
+        """Решает, нужен ли веб-поиск для ответа."""
         if not self.llm:
-            logger.info("Умный поиск | Этап 1/3 | LLM отключена, использую исходный запрос")
-            return [user_input]
+            logger.info("Второй пайплайн | LLM отключена, по умолчанию включаю поиск")
+            return True
 
-        prompt = build_decision_prompt(user_input)
-        logger.debug("LLM решение | Промпт (тип=%s, длина=%d): %s", type(prompt).__name__, len(prompt), prompt)
+        prompt = build_search_route_prompt(user_input)
+        logger.debug("Роутинг | Промпт (тип=%s, длина=%d): %s", type(prompt).__name__, len(prompt), prompt)
         try:
-            response = self.llm.complete(prompt)
-            logger.debug("LLM решение | Ответ (тип=%s, длина=%d): %r", type(response).__name__, len(response), response)
+            response = await asyncio.to_thread(self.llm.complete, prompt)
+            logger.debug("Роутинг | Ответ LLM (тип=%s, длина=%d): %r", type(response).__name__, len(response), response)
 
             if self._looks_like_error(response):
-                logger.warning("Умный поиск | Этап 1/3 | LLM вернула ошибку, использую исходный запрос")
-                return [user_input]
+                logger.warning("Роутинг | LLM вернула ошибку, по умолчанию включаю поиск")
+                return True
 
-            decision = self._parse_decision(response)
-            if not decision["use_extra_queries"]:
-                logger.info("Умный поиск | Этап 1/3 | Доп. запросы не нужны")
-                return [user_input]
-
-            queries = decision["queries"]
-            if len(queries) < 3:
-                logger.warning(
-                    "Умный поиск | Этап 1/3 | LLM вернула меньше 3 запросов (%d), дополняю исходным",
-                    len(queries),
-                )
-                queries = (queries + [user_input] * 3)[:3]
-
-            logger.info("Умный поиск | Этап 1/3 | Сформированы доп. запросы: %s", queries)
-            return queries[:3]
+            return self._parse_search_route(response)
         except Exception as exc:
-            logger.error("Умный поиск | Этап 1/3 | Ошибка генерации запросов: %s", exc)
-            return [user_input]
+            logger.error("Роутинг | Ошибка определения режима: %s", exc)
+            return True
 
-    def _parse_decision(self, text: str) -> Dict[str, object]:
+    def _parse_search_route(self, text: str) -> bool:
         if not text:
-            return {"use_extra_queries": False, "queries": []}
+            return True
         raw = text.strip()
         start = raw.find("{")
         end = raw.rfind("}")
@@ -279,17 +217,39 @@ class SearchAgent:
         try:
             data = json.loads(payload)
         except Exception:
-            return {"use_extra_queries": False, "queries": []}
+            return True
 
-        use_extra = bool(data.get("use_extra_queries"))
-        queries = data.get("queries") or []
-        if isinstance(queries, list):
-            queries = [str(item).strip() for item in queries if str(item).strip()]
-        else:
-            queries = []
-        return {"use_extra_queries": use_extra, "queries": queries}
+        if not isinstance(data, dict):
+            return True
 
-    def _summarize_results(self, original_query: str, results: List[Dict[str, object]]) -> str:
+        use_search = data.get("use_search")
+        if isinstance(use_search, bool):
+            return use_search
+        if isinstance(use_search, str):
+            normalized = use_search.strip().lower()
+            if normalized in {"true", "1", "yes", "да"}:
+                return True
+            if normalized in {"false", "0", "no", "нет"}:
+                return False
+        return True
+
+    async def _answer_without_search(self, query: str) -> str:
+        """Отвечает напрямую без веб-поиска."""
+        if not self.llm:
+            return "LLM отключена, поэтому отвечаю только через поиск. Включите /provider ollama или /provider openrouter."
+
+        prompt = build_direct_answer_prompt(query)
+        try:
+            answer = (await self._complete_with_recovery(prompt)).strip()
+        except Exception as exc:
+            logger.error("Прямой ответ | Ошибка LLM: %s", exc)
+            return "Не удалось сгенерировать ответ без поиска."
+
+        if not answer or self._looks_like_error(answer):
+            return "Не удалось сгенерировать ответ без поиска."
+        return answer
+
+    async def _summarize_results(self, original_query: str, results: List[Dict[str, object]]) -> str:
         if not results:
             return "Результатов не найдено."
 
@@ -299,17 +259,17 @@ class SearchAgent:
             return self._format_fallback(results, sources)
 
         results_text = []
-        for i, res in enumerate(results[:10], 1):
+        for i, res in enumerate(results[:2], 1):
             title = res.get("title", "").strip()
-            url = res.get("url", "").strip()
-            snippet = res.get("content", "").strip().replace("\n", " ")
-            snippet = snippet[:200] if snippet else ""
-            results_text.append(f"{i}. {title}\nURL: {url}\nФрагмент: {snippet}")
+            content = (res.get("display_content") or res.get("content") or "").strip()
+            snippet = self._build_summary_snippet(original_query, content, max_chars=3200) if content else ""
+            snippet = self._strip_links_for_llm(snippet)
+            results_text.append(f"{i}. {title}\nКонтент: {snippet}")
 
         prompt = build_summary_prompt(original_query, "\n\n".join(results_text))
         logger.debug("Суммаризация | Промпт (тип=%s, длина=%d): %s", type(prompt).__name__, len(prompt), prompt)
         try:
-            answer = self.llm.complete(prompt).strip()
+            answer = (await self._complete_with_recovery(prompt)).strip()
             logger.debug("Суммаризация | Ответ LLM (длина=%d): %s", len(answer), answer)
         except Exception as exc:
             logger.error("Суммаризация | Ошибка LLM: %s", exc)
@@ -388,6 +348,42 @@ class SearchAgent:
         ]
         answer_lower = answer.lower()
         return any(t in answer_lower for t in tokens)
+
+    def _build_summary_snippet(self, query: str, content: str, max_chars: int = 3200) -> str:
+        text = " ".join((content or "").split())
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+
+        query_tokens = [t for t in self._tokenize(query) if len(t) >= 4]
+        lowered = text.lower()
+        hit_pos = -1
+        for token in query_tokens:
+            pos = lowered.find(token)
+            if pos != -1:
+                hit_pos = pos
+                break
+
+        if hit_pos == -1:
+            return text[:max_chars]
+
+        half_window = max_chars // 2
+        start = max(0, hit_pos - half_window)
+        end = min(len(text), start + max_chars)
+        start = max(0, end - max_chars)
+        return text[start:end]
+
+    @staticmethod
+    def _strip_links_for_llm(text: str) -> str:
+        if not text:
+            return ""
+        # Markdown links: [text](url) -> text
+        text = re.sub(r"\[([^\]]+)\]\((?:https?://|www\.)[^)]+\)", r"\1", text, flags=re.IGNORECASE)
+        # Raw URLs
+        text = re.sub(r"https?://\S+", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bwww\.\S+\b", "", text, flags=re.IGNORECASE)
+        return " ".join(text.split())
 
     def _is_answer_relevant(
         self,
@@ -533,3 +529,38 @@ class SearchAgent:
         if value == "local":
             return "ollama"
         return value
+
+    @staticmethod
+    async def _notify_progress(
+        progress: Optional[ProgressCallback],
+        message: str,
+        current: float,
+        total: float = 100,
+    ) -> None:
+        if progress is None:
+            return
+        await progress(message, current, total)
+
+    async def _complete_with_recovery(self, prompt: str) -> str:
+        base_tokens = settings.llm_max_output_tokens
+        answer = await asyncio.to_thread(self.llm.complete, prompt, max_tokens=base_tokens)
+        if self._looks_truncated_answer(answer):
+            retry_tokens = min(max(base_tokens * 2, 3072), 8192)
+            logger.warning(
+                "Ответ LLM похож на усечённый. Повторяю генерацию с увеличенным лимитом: %d -> %d.",
+                base_tokens,
+                retry_tokens,
+            )
+            retry_answer = await asyncio.to_thread(self.llm.complete, prompt, max_tokens=retry_tokens)
+            if len(retry_answer.strip()) >= len(answer.strip()):
+                return retry_answer
+        return answer
+
+    @staticmethod
+    def _looks_truncated_answer(answer: str) -> bool:
+        text = (answer or "").strip()
+        if len(text) < 80:
+            return False
+        if text.endswith((".", "!", "?", "…", "\"", "'", "»", ")", "]")):
+            return False
+        return True

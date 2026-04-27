@@ -1,56 +1,137 @@
-import logging
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
 
-import httpx
+import atexit
+import asyncio
+import json
+import logging
+import queue
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 from config.settings import settings
+from src.mcp_stdio import MCPStdioClient
 
 logger = logging.getLogger("searxng_agent")
 
 class SearxngClient:
-    """Клиент для запроса SearxNG."""
+    """MCP-клиент для поиска через внутренний tool server."""
 
-    def __init__(self, instance_url: Optional[str] = None):
-        if instance_url:
-            self.instance_url = instance_url.rstrip("/")
-        else:
-            instances = settings.searxng_instances_list
-            if not instances:
-                raise ValueError("Не задан ни один инстанс SearxNG")
-            self.instance_url = instances[0].rstrip("/")
+    def __init__(self, server_cmd: Optional[Sequence[str]] = None, cwd: Optional[Path] = None):
+        repo_root = Path(__file__).resolve().parents[2]
+        instances = settings.searxng_instances_list
+        if not instances:
+            raise ValueError("Не задан ни один инстанс SearxNG")
+        self.instance_url = instances[0].rstrip("/")
+        self.tool_name = "searxng_search"
+        self.pool_size = min(max(1, settings.searxng_parallelism), 3)
+        self._closed = False
 
-        self.timeout = settings.request_timeout
+        resolved_cmd = list(server_cmd) if server_cmd else [
+            sys.executable,
+            str(repo_root / "src" / "main.py"),
+            "--searxng-mcp-server",
+        ]
+        resolved_cwd = cwd or repo_root
 
-    def search(
+        self._clients: List[MCPStdioClient] = []
+        self._client_pool: queue.Queue[MCPStdioClient] = queue.Queue()
+        for _ in range(self.pool_size):
+            client = MCPStdioClient(resolved_cmd, cwd=resolved_cwd)
+            self._clients.append(client)
+            self._client_pool.put(client)
+
+        self.backend_label = f"MCP:{self.tool_name} x{self.pool_size} -> {self.instance_url}"
+        atexit.register(self.close)
+        logger.info("MCP-клиент поиска инициализирован: %s", self.backend_label)
+
+    async def search(
         self,
         query: str,
         language: Optional[str] = None,
         categories: Optional[str] = None,
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
-        
-        params = {
-            "q": query,
-            "format": "json",
-            "language": language or settings.searxng_default_language,
-            "categories": categories or settings.searxng_default_categories,
-        }
+        """Выполняет поиск через MCP tool calling."""
 
-        url = f"{self.instance_url}/search"
-        logger.info("Запрос к SearxNG: %s, параметры=%s", url, params)
+        params = {
+            "query": query,
+            "language": language,
+            "categories": categories,
+            "limit": limit,
+        }
+        return await asyncio.to_thread(self._search_via_mcp, query, params)
+
+    def _search_via_mcp(self, query: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        client = self._client_pool.get()
+        try:
+            response_text = client.call_tool(self.tool_name, params)
+        finally:
+            self._client_pool.put(client)
+        return self._parse_results(query, response_text)
+
+    def _parse_results(self, query: str, response_text: str) -> List[Dict[str, Any]]:
+        if not response_text:
+            raise RuntimeError("MCP search tool вернул пустой ответ")
 
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.get(url, params=params)
+            data = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            logger.error("MCP search tool | Некорректный JSON: %r", response_text[:300])
+            raise RuntimeError("MCP search tool вернул некорректный JSON") from exc
 
-            response.raise_for_status()
-            data = response.json()
+        raw_results = self._extract_results(data)
 
-            logger.debug("Ответ SearxNG: %s", data)
-        except Exception as exc:
-            logger.error("Ошибка запроса к SearxNG: %s", exc)
-            raise
-
-        raw_results = data.get("results", [])[:limit]
-        logger.info("Результатов от SearxNG: %d", len(raw_results))
+        logger.info("MCP search tool | query=%r | results=%d", query, len(raw_results))
         return raw_results
+
+    def _extract_results(self, payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, list):
+            if not payload:
+                return []
+            if all(isinstance(item, dict) for item in payload):
+                known_result_fields = {"url", "title", "content", "engine", "score", "source"}
+                if any(set(item.keys()) & known_result_fields for item in payload):
+                    return payload
+            raise RuntimeError("MCP search tool вернул список неожиданной структуры")
+
+        if isinstance(payload, str):
+            if not payload.strip():
+                return []
+            try:
+                decoded = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("MCP search tool вернул неожиданный строковый формат ответа") from exc
+            return self._extract_results(decoded)
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("MCP search tool вернул неожиданный формат ответа")
+
+        if payload.get("error"):
+            raise RuntimeError(str(payload["error"]))
+
+        results = payload.get("results")
+        if isinstance(results, list):
+            return results
+        if results is not None:
+            return self._extract_results(results)
+
+        for key in ("result", "data", "payload", "structuredContent", "content"):
+            if key not in payload:
+                continue
+            nested = payload.get(key)
+            try:
+                extracted = self._extract_results(nested)
+                return extracted
+            except RuntimeError:
+                continue
+
+        payload_keys = ", ".join(sorted(payload.keys())) or "<empty>"
+        raise RuntimeError(f"MCP search tool вернул неожиданный формат: {payload_keys}")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for client in self._clients:
+            client.close()
