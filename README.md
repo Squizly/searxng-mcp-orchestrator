@@ -1,3 +1,12 @@
+<p align="center">
+  <img
+    src="https://github.com/user-attachments/assets/58157f17-37e6-424d-a1cf-f847de14ec72"
+    alt="SearxNG MCP Orchestrator Banner"
+    width="100%"
+    style="max-width: 1100px; border-radius: 18px;"
+  />
+</p>
+
 <div align="center">
 
 # SearxNG MCP Orchestrator
